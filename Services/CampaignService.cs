@@ -37,7 +37,7 @@ public class CampaignService : ICampaignService
     public async Task<object> StartCampaignAsync(CampaignRequest request, CampaignModelRequest model)
     {
         int totalSent = 0;
-        int batchSize = 14;  // Adjust based on SES or provider limit
+        int batchSize = 20;  // Adjust based on SES or provider limit
         var batch = new List<string>(batchSize);
 
         // Get the CSV object from S3
