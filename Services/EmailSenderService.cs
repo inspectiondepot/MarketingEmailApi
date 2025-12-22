@@ -59,8 +59,10 @@ public class EmailSenderService : IEmailSenderService
         string encryptedEmail = CryptoHelper.Encrypt(email);
 
         string unsubscribeUrl = $"https://www.paperlessinspectors.com/unsubscribe/Unsubscribe.aspx?token={encryptedEmail}";
+        string requestUrl = $"https://www.inspectiondepot.com/request-a-service?domain=1&emailid={encryptedEmail}";
 
         var finalHtml = htmlContent.Replace("###unsubscribe###", unsubscribeUrl);
+        finalHtml = htmlContent.Replace("###requestUrl###", requestUrl);
 
         var request = new SendEmailRequest
         {

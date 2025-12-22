@@ -33,18 +33,28 @@ public class CampaignService : ICampaignService
 
     public async Task<bool> CanSendEmailAsync(string email)
     {
+        string logPath = Path.Combine(Path.GetTempPath(), "InvalidEmails.txt");
         // 1️⃣ syntax check
         if (!IsValidEmail(email))
+        {
+            await File.AppendAllLinesAsync(logPath, new[] { $"{email}," });
             return false;
+        }
 
         // 2️⃣ suppression list check
         if (await IsOnSesSuppressionList(email))
+        {
+            await File.AppendAllLinesAsync(logPath, new[] { $"{email}," });
             return false;
+        }
 
         // 3️⃣ MX check
         var domain = email.Split('@')[1];
         if (!await HasMxRecordAsync(domain))
+        {
+            await File.AppendAllLinesAsync(logPath, new[] { $"{email}," });
             return false;
+        }
 
         return true;
     }
@@ -132,7 +142,7 @@ public class CampaignService : ICampaignService
 
         return new
         {
-            message = "Campaign started",
+            message = "Campaign End",
             total = totalSent
         };
     }
