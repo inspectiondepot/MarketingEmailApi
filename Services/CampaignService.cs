@@ -1,8 +1,10 @@
-﻿using Amazon.Runtime.Internal;
-using Amazon.S3;
+﻿using Amazon.S3;
+using Amazon.SimpleEmailV2;
+using Amazon.SimpleEmailV2.Model;
 using CsvHelper;
 using EmailCampaign.Models;
 using System.Globalization;
+using DnsClient;
 
 namespace EmailCampaign.Services;
 
@@ -11,14 +13,43 @@ public class CampaignService : ICampaignService
     private readonly IAmazonS3 _s3;
     private readonly IEmailSenderService _emailService;
     private readonly ITemplateService _templateService;
+    private readonly IAmazonSimpleEmailServiceV2 _ses;
 
-    public CampaignService(IAmazonS3 s3, IEmailSenderService emailService, ITemplateService templateService)
+
+    public CampaignService(IAmazonS3 s3, IEmailSenderService emailService, IAmazonSimpleEmailServiceV2 ses, ITemplateService templateService)
     {
         _s3 = s3;
+        _ses = ses;
         _emailService = emailService;
         _templateService = templateService;
     }
-   public bool IsValidEmail(string email)
+
+    public async Task<bool> HasMxRecordAsync(string domain)
+    {
+        var client = new LookupClient();
+        var result = await client.QueryAsync(domain, QueryType.MX);
+        return result.Answers.MxRecords().Any();
+    }
+
+    public async Task<bool> CanSendEmailAsync(string email)
+    {
+        // 1️⃣ syntax check
+        if (!IsValidEmail(email))
+            return false;
+
+        // 2️⃣ suppression list check
+        if (await IsOnSesSuppressionList(email))
+            return false;
+
+        // 3️⃣ MX check
+        var domain = email.Split('@')[1];
+        if (!await HasMxRecordAsync(domain))
+            return false;
+
+        return true;
+    }
+
+    public bool IsValidEmail(string email)
     {
         if (string.IsNullOrWhiteSpace(email))
             return false;
@@ -29,6 +60,26 @@ public class CampaignService : ICampaignService
             return addr.Address == email;
         }
         catch
+        {
+            return false;
+        }
+    }
+
+    public async Task<bool> IsOnSesSuppressionList(string email)
+    {
+        var request = new GetSuppressedDestinationRequest
+        {
+            EmailAddress = email
+        };
+
+        try
+        {
+            var response = await _ses.GetSuppressedDestinationAsync(request);
+
+            // If suppression exists, skip it
+            return response.SuppressedDestination != null;
+        }
+        catch (NotFoundException)
         {
             return false;
         }
@@ -53,7 +104,10 @@ public class CampaignService : ICampaignService
             var email = csv.GetField("Email");
             var active = csv.GetField<bool>("IsActive");
 
-            if (!IsValidEmail(email) || !active)
+            if (!await CanSendEmailAsync(email))
+                continue;
+
+            if (!active)
                 continue;
 
             batch.Add(email);
