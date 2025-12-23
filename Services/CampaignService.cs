@@ -220,7 +220,7 @@ namespace EmailCampaign.Services
                     total = emails.Count,
                     valid = validEmails.Count,
                     invalid = emails.Count - validEmails.Count,
-                    
+                    sent
                 };
             }
             catch (Exception ex)
