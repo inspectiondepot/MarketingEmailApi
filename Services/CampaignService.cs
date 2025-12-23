@@ -2,161 +2,307 @@
 using Amazon.SimpleEmailV2;
 using Amazon.SimpleEmailV2.Model;
 using CsvHelper;
-using EmailCampaign.Models;
-using System.Globalization;
 using DnsClient;
+using EmailCampaign.Models;
+using System.Collections.Concurrent;
+using System.Globalization;
+using System.Net.Mail;
 
-namespace EmailCampaign.Services;
-
-public class CampaignService : ICampaignService
+namespace EmailCampaign.Services
 {
-    private readonly IAmazonS3 _s3;
-    private readonly IEmailSenderService _emailService;
-    private readonly ITemplateService _templateService;
-    private readonly IAmazonSimpleEmailServiceV2 _ses;
-
-
-    public CampaignService(IAmazonS3 s3, IEmailSenderService emailService, IAmazonSimpleEmailServiceV2 ses, ITemplateService templateService)
+    public class CampaignService : ICampaignService
     {
-        _s3 = s3;
-        _ses = ses;
-        _emailService = emailService;
-        _templateService = templateService;
-    }
+        private readonly IAmazonS3 _s3;
+        private readonly IEmailSenderService _emailService;
+        private readonly ITemplateService _templateService;
+        private readonly IAmazonSimpleEmailServiceV2 _ses;
 
-    public async Task<bool> HasMxRecordAsync(string domain)
-    {
-        var client = new LookupClient();
-        var result = await client.QueryAsync(domain, QueryType.MX);
-        return result.Answers.MxRecords().Any();
-    }
+        private static readonly LookupClient _dnsClient = new();
 
-    public async Task<bool> CanSendEmailAsync(string email)
-    {
-        string logPath = Path.Combine(Path.GetTempPath(), "InvalidEmails.txt");
-        // 1️⃣ syntax check
-        if (!IsValidEmail(email))
+        private readonly ConcurrentDictionary<string, bool> _domainMxCache = new();
+        private readonly ConcurrentDictionary<string, bool> _suppressionCache = new();
+        private readonly ConcurrentBag<string> _invalidLogs = new();
+
+        private readonly SemaphoreSlim _mxThrottle = new(5);
+        private readonly SemaphoreSlim _suppressionThrottle = new(1);
+
+        private static readonly string InvalidLogFile =
+            Path.Combine(Path.GetTempPath(), "InvalidEmails.txt");
+
+        public CampaignService(
+            IAmazonS3 s3,
+            IEmailSenderService emailService,
+            IAmazonSimpleEmailServiceV2 ses,
+            ITemplateService templateService)
         {
-            await File.AppendAllLinesAsync(logPath, new[] { $"{email}," });
-            return false;
+            _s3 = s3;
+            _emailService = emailService;
+            _ses = ses;
+            _templateService = templateService;
         }
 
-        // 2️⃣ suppression list check
-        if (await IsOnSesSuppressionList(email))
+        // ------------------ SYNTAX CHECK ------------------
+        private bool IsValidSyntax(string email)
         {
-            await File.AppendAllLinesAsync(logPath, new[] { $"{email}," });
-            return false;
+            return MailAddress.TryCreate(email, out _);
         }
 
-        // 3️⃣ MX check
-        var domain = email.Split('@')[1];
-        if (!await HasMxRecordAsync(domain))
+        // ------------------ MX CHECK (CACHED) ------------------
+        private async Task<bool> HasMxRecordAsync(string domain)
         {
-            await File.AppendAllLinesAsync(logPath, new[] { $"{email}," });
-            return false;
-        }
+            if (_domainMxCache.TryGetValue(domain, out var cached))
+                return cached;
 
-        return true;
-    }
-
-    public bool IsValidEmail(string email)
-    {
-        if (string.IsNullOrWhiteSpace(email))
-            return false;
-
-        try
-        {
-            var addr = new System.Net.Mail.MailAddress(email);
-            return addr.Address == email;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    public async Task<bool> IsOnSesSuppressionList(string email)
-    {
-        var request = new GetSuppressedDestinationRequest
-        {
-            EmailAddress = email
-        };
-
-        try
-        {
-            var response = await _ses.GetSuppressedDestinationAsync(request);
-
-            // If suppression exists, skip it
-            return response.SuppressedDestination != null;
-        }
-        catch (NotFoundException)
-        {
-            return false;
-        }
-    }
-
-    public async Task<object> StartCampaignAsync(CampaignRequest request, CampaignModelRequest model)
-    {
-        int totalSent = 0;
-        int batchSize = 20;  // Adjust based on SES or provider limit
-        var batch = new List<string>(batchSize);
-
-        // Get the CSV object from S3
-        var obj = await _s3.GetObjectAsync(request.Bucket, request.Key);
-        using var reader = new StreamReader(obj.ResponseStream);
-        using var csv = new CsvReader(reader, CultureInfo.InvariantCulture);
-
-        csv.Read();
-        csv.ReadHeader();
-
-        while (csv.Read())
-        {
-            var email = csv.GetField("Email");
-            var active = csv.GetField<bool>("IsActive");
-
-            if (!await CanSendEmailAsync(email))
-                continue;
-
-            if (!active)
-                continue;
-
-            batch.Add(email);
-
-            if (batch.Count >= batchSize)
+            await _mxThrottle.WaitAsync();
+            try
             {
-                await SendBatchAsync(batch, request.Campaign, model);
-                totalSent += batch.Count;
-                batch.Clear();
+                if (_domainMxCache.TryGetValue(domain, out cached))
+                    return cached;
 
-                // Optional delay to respect rate limits
-                await Task.Delay(1000);
+                var mxResult = await _dnsClient.QueryAsync(domain, QueryType.MX);
+                bool valid = mxResult.Answers.MxRecords().Any();
+
+                if (!valid)
+                {
+                    var aResult = await _dnsClient.QueryAsync(domain, QueryType.A);
+                    valid = aResult.Answers.ARecords().Any();
+                }
+
+                _domainMxCache[domain] = valid;
+                return valid;
+            }
+            catch
+            {
+                _domainMxCache[domain] = false;
+                return false;
+            }
+            finally
+            {
+                _mxThrottle.Release();
             }
         }
 
-        // Send remaining emails
-        if (batch.Count > 0)
+        // ------------------ SES SUPPRESSION CHECK ------------------
+        private async Task<bool> IsOnSesSuppressionListAsync(string email)
         {
-            await SendBatchAsync(batch, request.Campaign, model);
-            totalSent += batch.Count;
+            if (_suppressionCache.TryGetValue(email, out var cached))
+                return cached;
+
+            await _suppressionThrottle.WaitAsync();
+            try
+            {
+                if (_suppressionCache.TryGetValue(email, out cached))
+                    return cached;
+
+                try
+                {
+                    var response = await _ses.GetSuppressedDestinationAsync(
+                        new GetSuppressedDestinationRequest
+                        {
+                            EmailAddress = email
+                        });
+
+                    _suppressionCache[email] = response?.SuppressedDestination != null;
+                }
+                catch (AmazonSimpleEmailServiceV2Exception ex)
+                    when (ex.ErrorCode == "NotFoundException")
+                {
+                    _suppressionCache[email] = false;
+                }
+                catch
+                {
+                    _suppressionCache[email] = false; // fail-safe
+                }
+
+                return _suppressionCache[email];
+            }
+            finally
+            {
+                _suppressionThrottle.Release();
+            }
         }
 
-        return new
+        // ------------------ FULL EMAIL VALIDATION ------------------
+        private async Task<bool> FullEmailCheckAsync(string email)
         {
-            message = "Campaign End",
-            total = totalSent
-        };
-    }
+            try
+            {
+                if (!IsValidSyntax(email))
+                {
+                    LogInvalid(email, "Invalid syntax");
+                    return false;
+                }
 
-    // Helper method to send emails concurrently in a batch
-    private async Task SendBatchAsync(List<string> emails, string campaign, CampaignModelRequest model)
-    {
-        var templateHtml = await _templateService.GetTemplateAsync(model.TemplateName);
+                if (await IsOnSesSuppressionListAsync(email))
+                {
+                    LogInvalid(email, "SES suppressed");
+                    return false;
+                }
 
-        await Task.WhenAll(emails.Select(async email =>
+                var domain = email.Split('@')[1];
+                if (!await HasMxRecordAsync(domain))
+                {
+                    LogInvalid(email, "No MX record");
+                    return false;
+                }
+
+                return true;
+            }
+            catch
+            {
+                LogInvalid(email, "Unexpected error");
+                return false;
+            }
+        }
+
+        private void LogInvalid(string email, string reason)
         {
-            var unsubscribeToken = Guid.NewGuid().ToString("N");
-            await _emailService.SendCampaignEmailAsync(email, campaign, unsubscribeToken, templateHtml, model);
-        }));
-    }
+            _invalidLogs.Add($"{email} ==> {reason}");
+        }
 
+        private async Task FlushInvalidLogsAsync()
+        {
+            if (_invalidLogs.Any())
+                await File.AppendAllLinesAsync(InvalidLogFile, _invalidLogs);
+        }
+
+        // ------------------ START CAMPAIGN ------------------
+        public async Task<object> StartCampaignAsync(
+            CampaignRequest request,
+            CampaignModelRequest model)
+        {
+            try
+            {
+                var s3Obj = await _s3.GetObjectAsync(request.Bucket, request.Key);
+
+                List<string> emails = new();
+
+                using (var reader = new StreamReader(s3Obj.ResponseStream))
+                using (var csv = new CsvReader(reader, CultureInfo.InvariantCulture))
+                {
+                    csv.Read();
+                    csv.ReadHeader();
+
+                    while (csv.Read())
+                    {
+                        try
+                        {
+                            if (!csv.GetField<bool>("IsActive"))
+                                continue;
+
+                            emails.Add(csv.GetField("Email"));
+                        }
+                        catch { }
+                    }
+                }
+
+                var validEmails = new ConcurrentBag<string>();
+
+                await Parallel.ForEachAsync(
+                    emails,
+                    new ParallelOptions { MaxDegreeOfParallelism = 20 },
+                    async (email, _) =>
+                    {
+                        if (await FullEmailCheckAsync(email))
+                            validEmails.Add(email);
+                    });
+
+                await FlushInvalidLogsAsync();
+
+                int sent = await SendCampaignEmailsAsync(
+                    validEmails.ToList(),
+                    request.Campaign,
+                    model);
+
+                return new
+                {
+                    message = "Campaign Completed",
+                    total = emails.Count,
+                    valid = validEmails.Count,
+                    invalid = emails.Count - validEmails.Count,
+                    
+                };
+            }
+            catch (Exception ex)
+            {
+                return new
+                {
+                    message = "Campaign Failed",
+                    error = ex.Message
+                };
+            }
+        }
+
+        // ------------------ EMAIL SENDING ------------------
+        private async Task<int> SendCampaignEmailsAsync(
+            List<string> emails,
+            string campaign,
+            CampaignModelRequest model)
+        {
+            if (!emails.Any())
+                return 0;
+
+            var template = await _templateService.GetTemplateAsync(model.TemplateName);
+
+            int sent = 0;
+            int batchSize = 10;
+            int maxParallel = 3;
+
+            SemaphoreSlim throttler = new(maxParallel);
+
+            foreach (var batch in emails.Chunk(batchSize))
+            {
+                await Task.WhenAll(batch.Select(async email =>
+                {
+                    await throttler.WaitAsync();
+                    try
+                    {
+                        await SendWithRetryAsync(async () =>
+                        {
+                            var token = Guid.NewGuid().ToString("N");
+                            await _emailService.SendCampaignEmailAsync(
+                                email,
+                                campaign,
+                                token,
+                                template,
+                                model);
+                        });
+
+                        Interlocked.Increment(ref sent);
+                    }
+                    finally
+                    {
+                        throttler.Release();
+                    }
+                }));
+
+                await Task.Delay(2000); // SES safe delay
+            }
+
+            return sent;
+        }
+
+        private async Task SendWithRetryAsync(Func<Task> sendAction)
+        {
+            int retry = 0;
+
+            while (true)
+            {
+                try
+                {
+                    await sendAction();
+                    return;
+                }
+                catch (AmazonSimpleEmailServiceV2Exception ex)
+                    when (ex.ErrorCode == "MaxSendRateExceeded")
+                {
+                    retry++;
+                    if (retry > 5)
+                        throw;
+
+                    await Task.Delay(500 * retry);
+                }
+            }
+        }
+    }
 }
